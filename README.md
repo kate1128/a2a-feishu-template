@@ -1,5 +1,14 @@
 # A2A Feishu Bot Template / 飞书 A2A 机器人模板
 
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.12+-blue?logo=python&logoColor=white" alt="Python 3.12+" />
+  <img src="https://img.shields.io/badge/license-Apache%202.0-green" alt="License" />
+  <img src="https://img.shields.io/badge/A2A-0.3-purple?logo=google&logoColor=white" alt="A2A 0.3" />
+  <img src="https://img.shields.io/badge/Feishu-Bot-blue?logo=feishu" alt="Feishu Bot" />
+  <img src="https://img.shields.io/badge/kagent-integrated-orange?logo=kubernetes" alt="kagent" />
+  <img src="https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white" alt="FastAPI" />
+</p>
+
 A template for a [Feishu](https://open.feishu.cn) (飞书) / [Lark](https://open.larksuite.com) bot that connects to [kagent](https://github.com/kagent-dev/kagent) via the [A2A protocol](https://github.com/google/A2A).
 
 飞书 / Lark 机器人模板，通过 [A2A 协议](https://github.com/google/A2A) 连接到 [kagent](https://github.com/kagent-dev/kagent)。
