@@ -3,6 +3,8 @@
 This bot receives webhook events from Feishu and forwards them to a kagent
 agent via the A2A protocol. Replies are sent back to Feishu.
 
+Supports both WebSocket (recommended) and HTTP webhook event subscriptions.
+
 Usage:
     uv sync
     cp .env.example .env   # fill in your credentials
@@ -16,18 +18,25 @@ import logging
 import os
 
 from dotenv import load_dotenv
+
+# Load .env BEFORE importing handlers (which reads env vars at module level)
+load_dotenv()
+
 from fastapi import FastAPI, Request, Response
 import uvicorn
 
 from handlers import (
+    APP_ID,
+    APP_SECRET,
     ENCRYPT_KEY,
     VERIFICATION_TOKEN,
+    DOMAIN,
+    DOMAIN_BASES,
     decrypt_payload,
     process_event,
     verify_signature,
 )
-
-load_dotenv()
+from ws_client import create_ws_client, run_ws_client_in_thread
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,15 +55,7 @@ async def health() -> dict[str, str]:
 
 @app.post("/webhook/feishu")
 async def feishu_webhook(request: Request) -> Response:
-    """Receive webhook events from Feishu.
-
-    Two kinds of requests arrive here:
-    1. Challenge handshake (type=url_verification) — Feishu verifies the URL
-       when you first configure the event subscription. Must respond with the
-       challenge value.
-    2. Event callback (type=event_callback) — actual events like
-       im.message.receive_v1.
-    """
+    """Receive webhook events from Feishu (fallback if WebSocket is not used)."""
     body_bytes = await request.body()
 
     # --- Signature verification (if Encrypt Key is configured) ---------------
@@ -68,7 +69,6 @@ async def feishu_webhook(request: Request) -> Response:
     except Exception:
         return Response(status_code=400, content="invalid json")
 
-    # If Encrypt Key is set, the payload is encrypted under the "encrypt" field.
     if ENCRYPT_KEY and "encrypt" in payload:
         try:
             payload = decrypt_payload(ENCRYPT_KEY, payload["encrypt"])
@@ -85,8 +85,6 @@ async def feishu_webhook(request: Request) -> Response:
         return Response(status_code=403, content="invalid token")
 
     # --- Process the event asynchronously ------------------------------------
-    # Feishu requires a 200 response within ~3 seconds, so we process in the
-    # background and return immediately.
     asyncio.create_task(_safe_process(payload))
     return Response(status_code=200, content="ok")
 
@@ -131,9 +129,29 @@ async def _safe_process(payload: dict) -> None:
 
 
 def main() -> None:
-    """Start the FastAPI server."""
+    """Start the bot server.
+
+    Runs both:
+    - FastAPI web server (for health check and webhook fallback)
+    - Feishu WebSocket client (for real-time event subscription)
+    """
     port = int(os.environ.get("PORT", "9000"))
-    logger.info("Starting Feishu A2A bridge on port %d", port)
+
+    # Start WebSocket client in a background thread
+    domain = DOMAIN_BASES.get(DOMAIN, DOMAIN_BASES["feishu"])
+    ws_client = create_ws_client(
+        app_id=APP_ID,
+        app_secret=APP_SECRET,
+        verification_token=VERIFICATION_TOKEN,
+        encrypt_key=ENCRYPT_KEY,
+        domain=domain,
+        process_event_callback=process_event,
+    )
+    ws_thread = run_ws_client_in_thread(ws_client)
+    logger.info("Feishu WebSocket client started (thread: %s)", ws_thread.name)
+
+    # Start FastAPI server (blocking)
+    logger.info("Starting FastAPI server on port %d", port)
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
