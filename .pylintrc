@@ -13,6 +13,9 @@ disable=
     R0911,  # too many return statements
     R0913,  # too many arguments
     W0611,  # unused-import (we have some conditional imports)
+    # The following are knowingly used in this project:
+    W0603,  # global-statement (used for token caching)
+    W0718,  # broad-exception-caught (used for async task safety)
 
 [FORMAT]
 max-line-length = 100
