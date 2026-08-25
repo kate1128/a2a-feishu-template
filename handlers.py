@@ -8,11 +8,14 @@ import hashlib
 import json
 import logging
 import os
+import re
+import time
 import uuid
 from typing import Any
 
+from Crypto.Cipher import AES
+
 import httpx
-import lark_oapi as lark
 
 logger = logging.getLogger(__name__)
 
@@ -37,17 +40,16 @@ DOMAIN_BASES = {
 # Feishu token management
 # ---------------------------------------------------------------------------
 
-_access_token: str = ""
-_token_expires: float = 0
+_ACCESS_TOKEN: str = ""
+_TOKEN_EXPIRES: float = 0
 
 
 async def get_access_token() -> str:
     """Get or refresh the tenant access token."""
-    global _access_token, _token_expires
-    import time
+    global _ACCESS_TOKEN, _TOKEN_EXPIRES
 
-    if _access_token and time.time() < _token_expires:
-        return _access_token
+    if _ACCESS_TOKEN and time.time() < _TOKEN_EXPIRES:
+        return _ACCESS_TOKEN
 
     if not APP_ID or not APP_SECRET:
         raise RuntimeError("FEISHU_APP_ID and FEISHU_APP_SECRET must be set")
@@ -61,10 +63,10 @@ async def get_access_token() -> str:
         data = resp.json()
         if data.get("code") != 0:
             raise RuntimeError(f"Failed to get access token: {data}")
-        _access_token = data["tenant_access_token"]
+        _ACCESS_TOKEN = data["tenant_access_token"]
         # Token expires in `expire` seconds, refresh 5 min early
-        _token_expires = time.time() + data.get("expire", 7200) - 300
-        return _access_token
+        _TOKEN_EXPIRES = time.time() + data.get("expire", 7200) - 300
+        return _ACCESS_TOKEN
 
 
 # ---------------------------------------------------------------------------
@@ -91,8 +93,6 @@ def decrypt_payload(encrypt_key: str, encrypted: str) -> dict[str, Any]:
 
     Feishu uses AES-256-CBC with the key = sha256(encrypt_key).
     """
-    from Crypto.Cipher import AES
-
     if not encrypt_key:
         raise ValueError("encrypt_key is required to decrypt payload")
 
@@ -344,8 +344,6 @@ async def _handle_message(event: dict[str, Any]) -> None:
 
 def _strip_mentions(text: str) -> str:
     """Remove @_user_N mentions from message text."""
-    import re
-
     return re.sub(r"@_user_\d+\s*", "", text)
 
 

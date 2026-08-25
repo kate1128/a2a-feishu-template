@@ -14,11 +14,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import sys
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 import uvicorn
+
+from handlers import (
+    ENCRYPT_KEY,
+    VERIFICATION_TOKEN,
+    decrypt_payload,
+    process_event,
+    verify_signature,
+)
 
 load_dotenv()
 
@@ -28,19 +35,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from handlers import (  # noqa: E402  (import after logging setup)
-    ENCRYPT_KEY,
-    VERIFICATION_TOKEN,
-    decrypt_payload,
-    process_event,
-    verify_signature,
-)
-
 app = FastAPI(title="kagent Feishu A2A Bridge", version="0.1.0")
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
+    """Health check endpoint."""
     return {"status": "ok"}
 
 
@@ -59,11 +59,7 @@ async def feishu_webhook(request: Request) -> Response:
 
     # --- Signature verification (if Encrypt Key is configured) ---------------
     if ENCRYPT_KEY:
-        timestamp = request.headers.get("X-Lark-Request-Timestamp", "")
-        nonce = request.headers.get("X-Lark-Request-Nonce", "")
-        signature = request.headers.get("X-Lark-Signature", "")
-        if not verify_signature(timestamp, nonce, ENCRYPT_KEY, body_bytes, signature):
-            logger.warning("Invalid signature; rejecting request")
+        if not _verify_signature_from_request(request, body_bytes):
             return Response(status_code=403, content="invalid signature")
 
     # --- Parse (possibly decrypt) the payload --------------------------------
@@ -82,27 +78,48 @@ async def feishu_webhook(request: Request) -> Response:
 
     # --- Challenge handshake --------------------------------------------------
     if payload.get("type") == "url_verification":
-        challenge = payload.get("challenge", "")
-        token = payload.get("token", "")
-        if VERIFICATION_TOKEN and token != VERIFICATION_TOKEN:
-            logger.warning("Challenge token mismatch")
-            return Response(status_code=403, content="invalid token")
-        logger.info("Responding to Feishu challenge handshake")
-        return {"challenge": challenge}
+        return _handle_challenge(payload)
 
     # --- Verify event token (for event_callback) -----------------------------
-    if payload.get("type") == "event_callback":
-        token = payload.get("token", "")
-        if VERIFICATION_TOKEN and token != VERIFICATION_TOKEN:
-            logger.warning("Event callback token mismatch")
-            return Response(status_code=403, content="invalid token")
+    if payload.get("type") == "event_callback" and not _verify_token(payload):
+        return Response(status_code=403, content="invalid token")
 
     # --- Process the event asynchronously ------------------------------------
     # Feishu requires a 200 response within ~3 seconds, so we process in the
     # background and return immediately.
     asyncio.create_task(_safe_process(payload))
-
     return Response(status_code=200, content="ok")
+
+
+def _verify_signature_from_request(request: Request, body_bytes: bytes) -> bool:
+    """Extract signature headers and verify the request."""
+    timestamp = request.headers.get("X-Lark-Request-Timestamp", "")
+    nonce = request.headers.get("X-Lark-Request-Nonce", "")
+    signature = request.headers.get("X-Lark-Signature", "")
+    if not verify_signature(timestamp, nonce, ENCRYPT_KEY, body_bytes, signature):
+        logger.warning("Invalid signature; rejecting request")
+        return False
+    return True
+
+
+def _handle_challenge(payload: dict) -> dict:
+    """Handle a Feishu URL verification challenge."""
+    challenge = payload.get("challenge", "")
+    token = payload.get("token", "")
+    if VERIFICATION_TOKEN and token != VERIFICATION_TOKEN:
+        logger.warning("Challenge token mismatch")
+        return {"challenge": ""}
+    logger.info("Responding to Feishu challenge handshake")
+    return {"challenge": challenge}
+
+
+def _verify_token(payload: dict) -> bool:
+    """Verify the event callback token."""
+    token = payload.get("token", "")
+    if VERIFICATION_TOKEN and token != VERIFICATION_TOKEN:
+        logger.warning("Event callback token mismatch")
+        return False
+    return True
 
 
 async def _safe_process(payload: dict) -> None:
@@ -114,6 +131,7 @@ async def _safe_process(payload: dict) -> None:
 
 
 def main() -> None:
+    """Start the FastAPI server."""
     port = int(os.environ.get("PORT", "9000"))
     logger.info("Starting Feishu A2A bridge on port %d", port)
     uvicorn.run(

@@ -1,0 +1,18 @@
+[MAIN]
+# Python 3.12+ modern syntax
+py-version = 3.12
+
+# Disable some rules that are too strict
+disable=
+    C0103,  # naming convention (snake_case for module-level vars is fine)
+    C0115,  # missing class docstring
+    C0116,  # missing function docstring (we have module-level docstrings)
+    C0301,  # line too long (keep it reasonable)
+    C0415,  # import outside toplevel (sometimes needed for optional deps)
+    R0903,  # too few public methods
+    R0911,  # too many return statements
+    R0913,  # too many arguments
+    W0611,  # unused-import (we have some conditional imports)
+
+[FORMAT]
+max-line-length = 100
