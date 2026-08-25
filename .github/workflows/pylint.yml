@@ -16,14 +16,12 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
-    - name: Install uv
-      run: |
-        pip install uv
-
     - name: Install dependencies
       run: |
+        pip install uv
         uv sync
+        uv pip install pylint
 
-    - name: Analyse code with pylint
+    - name: Lint with pylint
       run: |
         uv run pylint $(git ls-files '*.py')
