@@ -79,13 +79,15 @@ def _cleanup_sessions() -> None:
 
 _ACCESS_TOKEN: str = ""
 _TOKEN_EXPIRES: float = 0
+_HTTP_CLIENT: httpx.AsyncClient | None = None
 
 
-@functools.lru_cache(maxsize=1)
 def _get_http_client() -> httpx.AsyncClient:
-    """Get a shared HTTP client with IPv4 preference."""
-    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
-    return httpx.AsyncClient(transport=transport, timeout=600.0)
+    """Get a shared HTTP client."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        _HTTP_CLIENT = httpx.AsyncClient(timeout=600.0)
+    return _HTTP_CLIENT
 
 
 async def get_access_token() -> str:
@@ -111,6 +113,134 @@ async def get_access_token() -> str:
     # Token expires in `expire` seconds, refresh 5 min early
     _TOKEN_EXPIRES = time.time() + data.get("expire", 7200) - 300
     return _ACCESS_TOKEN
+
+
+# ---------------------------------------------------------------------------
+# Feishu reactions (thinking / error indicators)
+# ---------------------------------------------------------------------------
+
+# Feishu emoji types for processing status
+_FEISHU_REACTION_THINKING = "Typing"     # 👀 "typing" indicator
+_FEISHU_REACTION_DONE = None             # removed on success
+_FEISHU_REACTION_ERROR = "CrossMark"     # ❌ — error indicator
+
+
+async def _add_reaction(message_id: str, emoji_type: str) -> str | None:
+    """Add a reaction emoji to a message. Returns reaction_id on success."""
+    token = await get_access_token()
+    base_url = DOMAIN_BASES.get(DOMAIN, DOMAIN_BASES["feishu"])
+    client = _get_http_client()
+    resp = await client.post(
+        f"{base_url}/open-apis/im/v1/messages/{message_id}/reactions",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"reaction_type": {"emoji_type": emoji_type}},
+    )
+    data = resp.json()
+    if data.get("code") == 0:
+        return data.get("data", {}).get("reaction_id")
+    logger.debug("Add reaction %s on %s: code=%s", emoji_type, message_id, data.get("code"))
+    return None
+
+
+async def _remove_reaction(message_id: str, reaction_id: str) -> bool:
+    """Remove a reaction by its reaction_id."""
+    token = await get_access_token()
+    base_url = DOMAIN_BASES.get(DOMAIN, DOMAIN_BASES["feishu"])
+    client = _get_http_client()
+    resp = await client.delete(
+        f"{base_url}/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    return resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Streaming card support
+# ---------------------------------------------------------------------------
+
+# Track active streaming cards: message_id -> {"card_id": str, "content": str}
+_streaming_cards: dict[str, dict[str, Any]] = {}
+
+
+async def _send_thinking_card(chat_id: str, reply_to_msg_id: str | None = None) -> str | None:
+    """Send a 'thinking' card and return the message_id for later updates.
+
+    If reply_to_msg_id is provided, the card is sent as a reply (appears in
+    the same thread/topic). Otherwise it's sent as a new message.
+    """
+    token = await get_access_token()
+    base_url = DOMAIN_BASES.get(DOMAIN, DOMAIN_BASES["feishu"])
+    client = _get_http_client()
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": "🤔 思考中..."}, "template": "blue"},
+        "elements": [
+            {"tag": "markdown", "content": "正在思考，请稍候..."},
+            {"tag": "hr"},
+            {"tag": "note", "elements": [{"tag": "plain_text", "content": "kagent"}]},
+        ],
+    }
+
+    if reply_to_msg_id:
+        # Reply to the original message (appears in the same thread)
+        resp = await client.post(
+            f"{base_url}/open-apis/im/v1/messages/{reply_to_msg_id}/reply",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"msg_type": "interactive", "content": json.dumps(card)},
+        )
+    else:
+        # Send as new message
+        resp = await client.post(
+            f"{base_url}/open-apis/im/v1/messages",
+            params={"receive_id_type": "chat_id"},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"receive_id": chat_id, "msg_type": "interactive", "content": json.dumps(card)},
+        )
+
+    data = resp.json()
+    if data.get("code") == 0:
+        msg_id = data.get("data", {}).get("message_id")
+        if msg_id:
+            _streaming_cards[msg_id] = {"card_id": None, "content": ""}
+            return msg_id
+    return None
+
+
+async def _update_streaming_card(message_id: str, new_content: str) -> None:
+    """Update the content of a streaming card.
+
+    Uses the Feishu message update API:
+    PATCH /open-apis/im/v1/messages/{message_id}
+    """
+    tracked = _streaming_cards.get(message_id)
+    if not tracked:
+        return
+
+    token = await get_access_token()
+    base_url = DOMAIN_BASES.get(DOMAIN, DOMAIN_BASES["feishu"])
+    client = _get_http_client()
+
+    markdown_text = _text_to_card_markdown(new_content)
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": "💬 kagent 回复"}, "template": "blue"},
+        "elements": [
+            {"tag": "markdown", "content": markdown_text},
+            {"tag": "hr"},
+            {"tag": "note", "elements": [{"tag": "plain_text", "content": "kagent"}]},
+        ],
+    }
+
+    resp = await client.patch(
+        f"{base_url}/open-apis/im/v1/messages/{message_id}",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"msg_type": "interactive", "content": json.dumps(card)},
+    )
+    if resp.status_code == 200:
+        tracked["card_id"] = "active"
+        tracked["content"] = new_content
+    else:
+        logger.debug("Card update failed: %s %s", resp.status_code, resp.text)
 
 
 # ---------------------------------------------------------------------------
@@ -361,28 +491,42 @@ def _build_card(markdown_text: str, card_color: str, header_text: str) -> dict:
 
 
 def _text_to_card_markdown(text: str) -> str:
-    """Convert plain text to card-compatible markdown.
+    """Convert text to card-compatible content.
 
-    - Preserves code blocks (```)
-    - Preserves tables (| ... |)
-    - Preserves lists (-, 1.)
-    - Preserves bold (**)
-    - Escapes special characters that might break the card
+    Feishu card markdown supports: **bold**, *italic*, ~~strikethrough~~,
+    `inline code`, ```code blocks```, [links](url), headers, lists.
+
+    Tables (| ... |) are NOT supported by the card markdown tag.
+    We convert them to plain text for readability.
     """
     lines = text.split("\n")
     result = []
-    in_code_block = False
+    in_table = False
 
     for line in lines:
-        if line.startswith("```"):
-            in_code_block = not in_code_block
-            result.append(line)
-        elif in_code_block:
-            result.append(line)
-        else:
-            # Escape problematic characters for Feishu card markdown
-            line = line.replace("<", "&lt;").replace(">", "&gt;")
-            result.append(line)
+        stripped = line.strip()
+        # Skip separator rows like |---|---|
+        if re.match(r'^\|[\s\-:]+\|[\s\-:]+\|', stripped):
+            # Replace with a thin separator
+            result.append("")
+            continue
+        # Detect table rows: | col1 | col2 |
+        if stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 3:
+            cells = [c.strip() for c in stripped.split("|")[1:-1]]
+            if not in_table:
+                result.append("")
+                # Add header underline
+                header = " | ".join(cells)
+                result.append(f"**{header}**")
+                in_table = True
+            else:
+                result.append(" | ".join(cells))
+            continue
+        # End of table
+        if in_table:
+            result.append("")
+            in_table = False
+        result.append(line)
 
     return "\n".join(result)
 
@@ -551,34 +695,41 @@ async def _handle_message(event: dict[str, Any]) -> None:
         text,
     )
 
-    # Get session for context
+    # 1. Add "thinking" reaction to indicate processing
+    thinking_reaction_id = None
+    if msg_id:
+        thinking_reaction_id = await _add_reaction(msg_id, _FEISHU_REACTION_THINKING)
+
+    # 2. Send a "thinking" card immediately (reply to the original message for thread support)
+    card_msg_id = await _send_thinking_card(chat_id, reply_to_msg_id=msg_id)
+
+    # 3. Get session for context
     session = _get_session(chat_id)
     context_id = session.get("context_id")
 
-    # Call A2A with context
+    # 4. Call A2A
     reply, new_context_id = await invoke_a2a(text, context_id=context_id)
 
-    # Update session with new context
+    # 5. Update session with new context
     if new_context_id:
         _update_session(chat_id, new_context_id)
 
-    # Handle errors
+    # 6. Handle errors
     if reply is None:
-        await send_error_message(
-            chat_id, "timeout", thread_id=thread_id, message_id=msg_id
-        )
+        if card_msg_id:
+            await _update_streaming_card(card_msg_id, "⏰ kagent 响应超时，请稍后重试。")
+        if thinking_reaction_id and msg_id:
+            await _remove_reaction(msg_id, thinking_reaction_id)
+            await _add_reaction(msg_id, _FEISHU_REACTION_ERROR)
         return
 
-    # Send reply as card
-    # Use a short summary of user's message as card header
-    header_text = f"💬 {text[:30]}{'...' if len(text) > 30 else ''}"
-    await reply_to_feishu_with_card(
-        chat_id,
-        reply,
-        thread_id=thread_id,
-        message_id=msg_id,
-        header_text=header_text,
-    )
+    # 7. Update the streaming card with the final reply
+    if card_msg_id:
+        await _update_streaming_card(card_msg_id, reply)
+
+    # 8. Remove thinking reaction on success
+    if thinking_reaction_id and msg_id:
+        await _remove_reaction(msg_id, thinking_reaction_id)
 
 
 def _strip_mentions(text: str) -> str:

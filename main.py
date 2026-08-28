@@ -36,7 +36,7 @@ from handlers import (
     process_event,
     verify_signature,
 )
-from ws_client import run_ws_client_in_thread
+from ws_client import run_ws_client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -139,11 +139,13 @@ def main() -> None:
 
     # Start WebSocket client in a background thread
     base_url = DOMAIN_BASES.get(DOMAIN, DOMAIN_BASES["feishu"])
-    ws_thread = run_ws_client_in_thread(
+    ws_thread = run_ws_client(
         app_id=APP_ID,
         app_secret=APP_SECRET,
         base_url=base_url,
         process_event_callback=process_event,
+        encrypt_key=ENCRYPT_KEY,
+        verification_token=VERIFICATION_TOKEN,
     )
     logger.info("Feishu WebSocket client started (thread: %s)", ws_thread.name)
 
