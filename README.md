@@ -9,30 +9,59 @@
   <img src="https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white" alt="FastAPI" />
 </p>
 
-A template for a [Feishu](https://open.feishu.cn) (飞书) / [Lark](https://open.larksuite.com) bot that connects to [kagent](https://github.com/kagent-dev/kagent) via the [A2A protocol](https://github.com/google/A2A).
+A [Feishu](https://open.feishu.cn) (飞书) / [Lark](https://open.larksuite.com) bot that connects to [kagent](https://github.com/kagent-dev/kagent) agents via the [A2A protocol](https://github.com/google/A2A).
 
-飞书 / Lark 机器人模板，通过 [A2A 协议](https://github.com/google/A2A) 连接到 [kagent](https://github.com/kagent-dev/kagent)。
+飞书 / Lark 机器人模板，通过 [A2A 协议](https://github.com/google/A2A) 连接到 [kagent](https://github.com/kagent-dev/kagent) agent。
 
 ---
+
+## Features
+
+| Feature | Status | Details |
+|---|---|---|
+| **WebSocket mode** (recommended) | ✅ | No public URL needed — connects directly to Feishu |
+| **Webhook mode** (fallback) | ✅ | HTTPS webhook endpoint at `/webhook/feishu` |
+| **Streaming card replies** | ✅ | Real-time card updates as the agent responds |
+| **"Thinking" reaction** | ✅ | 👀 reaction on message → removed on completion |
+| **Error reaction** | ✅ | ❌ reaction on failure |
+| **Interactive card replies** | ✅ | Rich markdown cards with header, footer |
+| **Session management** | ✅ | 30-min context window per chat |
+| **Text messages** | ✅ | Group chats and DMs |
+| **Rich text (post) messages** | ✅ | Extracts text from post messages |
+| **Thread replies** | ✅ | Replies in the same thread |
+| **Long text splitting** | ✅ | Handles Feishu's 4KB limit |
+| **AES encryption** | ✅ | Optional event payload decryption |
+| **Feishu / Lark dual support** | ✅ | Switch via `FEISHU_DOMAIN` env var |
 
 ## Architecture / 架构
 
 ```
 Feishu user (@bot hello)
        │
+       │ WebSocket (default, no public URL)  or  HTTPS webhook (fallback)
        ▼
-Feishu Open Platform (event webhook)
-       │  HTTPS POST
-       ▼
-┌──────────────────────────────┐
-│  This bot (FastAPI)          │
-│  - Verifies signature        │
-│  - Decrypts payload (opt)    │
-│  - Parses message            │
-│  - Calls kagent via A2A      │
-│  - Sends reply to Feishu     │
-└──────────────────────────────┘
-       │  A2A JSON-RPC
+┌──────────────────────────────────────────┐
+│  This bot (FastAPI + WebSocket Client)   │
+│                                         │
+│  ┌─ WebSocket ───────────────────────┐  │
+│  │  Connects to Feishu push channel  │  │
+│  │  Auto-reconnect on disconnect     │  │
+│  └───────────────────────────────────┘  │
+│                                         │
+│  ┌─ Event Processing ───────────────┐  │
+│  │  im.message.receive_v1 → A2A     │  │
+│  │  👀 thinking reaction            │  │
+│  │  🤔 thinking card sent           │  │
+│  │  🔄 streaming card update        │  │
+│  │  ✅ reaction removed on success   │  │
+│  └───────────────────────────────────┘  │
+│                                         │
+│  ┌─ A2A Client ─────────────────────┐  │
+│  │  JSON-RPC to kagent              │  │
+│  │  Session context preserved       │  │
+│  └───────────────────────────────────┘  │
+└──────────────────────────────────────────┘
+       │  A2A JSON-RPC (HTTP)
        ▼
 kagent (Agent A2A endpoint)
        │  LLM + tools
@@ -45,101 +74,76 @@ kagent (Agent A2A endpoint)
 - Python 3.12+
 - A Feishu / Lark custom app with:
   - App ID and App Secret (in "Credentials & Basic Info")
-  - Event subscription configured with Verification Token and Encrypt Key
-  - Permissions granted:
+  - **Event subscription** configured with `im.message.receive_v1` event
+  - Permissions granted **and published as a version**:
     - `im:message` — send messages
     - `im:message.p2p_msg` — receive direct messages
     - `im:message.group_at_msg` — receive group @bot messages
     - `im:chat:readonly` — read chat info
-  - Event subscription URL set to your bot's public URL (e.g. `https://your-bot.example.com/webhook/feishu`)
-  - Event added: `im.message.receive_v1`
+  - **WebSocket mode**: No event subscription URL needed
+  - **Webhook mode**: Set event subscription URL to `https://your-bot.example.com/webhook/feishu`
+- A kagent agent with an A2A endpoint exposed (e.g. `http://<controller>:8083/api/a2a/<ns>/<name>`)
 
-- A kagent agent with an A2A endpoint exposed (see [kagent docs](https://kagent.dev/docs/))
+## Quick Start / 快速开始
 
-## Setup / 设置
-
-### 1. Clone / 克隆
+### 1. Install
 
 ```bash
 git clone https://github.com/kagent-dev/a2a-feishu-template.git
 cd a2a-feishu-template
-```
-
-### 2. Install dependencies / 安装依赖
-
-```bash
 uv sync
 ```
 
-Or with pip:
-```bash
-pip install -r requirements.txt  # if you generate one from pyproject.toml
-```
-
-### 3. Configure / 配置
+### 2. Configure
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` and fill in:
+Edit `.env`:
 
-| Variable | Description | Example |
-|---|---|---|
-| `FEISHU_APP_ID` | Feishu app ID (cli_xxxx) | `cli_a1b2c3d4e5` |
-| `FEISHU_APP_SECRET` | Feishu app secret | `xxxxxxxxxxxxxxxx` |
-| `FEISHU_VERIFICATION_TOKEN` | Event subscription verification token | `xxxxxxxxxxxxxxxx` |
-| `FEISHU_ENCRYPT_KEY` | Event subscription encrypt key (optional but recommended) | `xxxxxxxxxxxxxxxx` |
-| `FEISHU_DOMAIN` | `feishu` (China) or `lark` (international) | `feishu` |
-| `KAGENT_A2A_URL` | kagent A2A endpoint URL | `http://localhost:8080/a2a/default/my-agent` |
-| `PORT` | HTTP port (default 9000) | `9000` |
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FEISHU_APP_ID` | ✅ | — | Feishu app ID (`cli_xxxx`) |
+| `FEISHU_APP_SECRET` | ✅ | — | Feishu app secret |
+| `KAGENT_A2A_URL` | ✅ | — | kagent A2A endpoint URL |
+| `FEISHU_DOMAIN` | ❌ | `feishu` | `feishu` (China) or `lark` (international) |
+| `FEISHU_VERIFICATION_TOKEN` | ❌ | — | Webhook verification token (webhook mode only) |
+| `FEISHU_ENCRYPT_KEY` | ❌ | — | Event payload encryption key (webhook mode only) |
+| `PORT` | ❌ | `9000` | HTTP server port |
 
-### 4. Run / 运行
+### 3. Run
 
 ```bash
 uv run main.py
 ```
 
-The bot starts on port 9000 by default. Feishu will POST events to `/webhook/feishu`.
+The bot starts with:
+- **WebSocket client** → connects to Feishu automatically, no public URL needed
+- **FastAPI server** → health check at `/health`, webhook fallback at `/webhook/feishu`
 
-### 5. Expose to the internet / 暴露到公网
+### 4. Add the bot to a Feishu group
 
-Feishu webhooks require a public HTTPS endpoint. For local testing, use [ngrok](https://ngrok.com/) or [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/):
-
-```bash
-ngrok http 9000
-```
-
-Then set the resulting URL (e.g. `https://abcd-1234.ngrok.io/webhook/feishu`) as the event subscription URL in the Feishu developer console.
+In Feishu, open the group chat → Settings → Bots → Add bot → select your custom app. Then `@mention` the bot to chat.
 
 ## Usage / 使用
 
-1. Add the bot to a Feishu group chat, or DM it directly.
-2. Send a message (in a group, `@bot` it first).
-3. The bot forwards the message to kagent via A2A, and replies with the agent's response.
-
-## Features / 功能
-
-- ✅ Text messages (in group chats and DMs)
-- ✅ Auto-splits long replies (Feishu has a 4KB message limit)
-- ✅ Supports both Feishu (China) and Lark (international)
-- ✅ Optional payload encryption (AES-256-CBC)
-- ✅ Strips `@bot` mentions in group chats
-
-## Limitations / 限制
-
-- ⚠️ v1: only text messages (no images, files, rich text yet)
-- ⚠️ No streaming replies (Feishu API doesn't support message editing well)
-- ⚠️ No session management yet (each message is an independent A2A call)
+```
+用户: @bot 帮我查一下集群状态
+  → bot 👀 (thinking reaction)
+  → bot 🤔 思考中... (card appears)
+  → bot 💬 集群状态如下: ... (card updates with reply)
+  → bot 👀 removed
+```
 
 ## References / 参考
 
-- [Slack A2A template](https://github.com/kagent-dev/a2a-slack-template) — the template this was modeled after
 - [kagent docs](https://kagent.dev/docs/)
 - [Feishu Open Platform docs](https://open.feishu.cn/document/)
 - [Lark Developer docs](https://open.larksuite.com/document/)
 - [A2A protocol](https://github.com/google/A2A)
+- [Hermes Agent Feishu adapter](https://github.com/NousResearch/hermes-agent) (reference implementation)
 
 ## License
 
-Apache 2.0 — same as kagent.
+Apache 2.0
