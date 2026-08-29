@@ -79,6 +79,51 @@ def _ws_event_adapter(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         logger.exception("Error in WS event callback")
 
 
+def _card_action_adapter(data: lark.im.v1.P2CardActionTrigger) -> None:
+    """Handle card action trigger events (button clicks).
+
+    Converts the SDK event to the format expected by process_event
+    and schedules it on the event loop.
+    """
+    try:
+        asyncio.create_task(_on_card_action(data))
+    except Exception:
+        logger.exception("Error in card action callback")
+
+
+async def _on_card_action(data: lark.im.v1.P2CardActionTrigger) -> None:
+    """Handle a card action (button click) event."""
+    event = data.event
+    if not event or not hasattr(event, "action"):
+        return
+
+    action = event.action
+    action_value = getattr(action, "value", None) or {}
+    chat_id = ""
+    message_id = ""
+
+    context = getattr(event, "context", None)
+    if context:
+        chat_id = getattr(context, "open_chat_id", "") or ""
+        message_id = getattr(context, "open_message_id", "") or ""
+
+    payload = {
+        "header": {
+            "event_id": data.header.event_id if data.header else "",
+            "event_type": "card.action.trigger",
+        },
+        "event": {
+            "action": {"tag": getattr(action, "tag", ""), "value": action_value},
+            "context": {"open_chat_id": chat_id, "open_message_id": message_id},
+            "operator": {
+                "open_id": getattr(event.operator, "open_id", "") if hasattr(event, "operator") and event.operator else "",
+            },
+        },
+    }
+    if _callback:
+        await _callback(payload)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -111,6 +156,7 @@ def run_ws_client(
     handler = (
         lark.EventDispatcherHandler.builder(encrypt_key, verification_token, lark.LogLevel.WARNING)
         .register_p2_im_message_receive_v1(_ws_event_adapter)
+        .register_p2_card_action_trigger(_card_action_adapter)
         .build()
     )
 

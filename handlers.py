@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import functools
 import hashlib
 import json
 import logging
@@ -12,6 +11,7 @@ import os
 import re
 import time
 import uuid
+from datetime import datetime
 from typing import Any
 
 from Crypto.Cipher import AES
@@ -52,15 +52,24 @@ def _get_session(chat_id: str) -> dict[str, Any]:
     if session:
         session["last_active"] = time.time()
         return session
-    session = {"context_id": None, "last_active": time.time()}
+    session = {"context_id": None, "last_active": time.time(), "history": []}
     _sessions[chat_id] = session
     return session
 
 
-def _update_session(chat_id: str, context_id: str | None) -> None:
-    """Update the session with a new context_id."""
+def _update_session(chat_id: str, context_id: str | None, user_text: str = "", agent_text: str = "") -> None:
+    """Update the session with a new context_id and history entry."""
     if context_id:
-        _sessions[chat_id] = {"context_id": context_id, "last_active": time.time()}
+        entry = _sessions.get(chat_id, {})
+        entry["context_id"] = context_id
+        entry["last_active"] = time.time()
+        if user_text:
+            entry.setdefault("history", []).append({
+                "user": user_text,
+                "agent": agent_text,
+                "time": datetime.now().strftime("%H:%M"),
+            })
+        _sessions[chat_id] = entry
 
 
 def _cleanup_sessions() -> None:
@@ -162,40 +171,64 @@ async def _remove_reaction(message_id: str, reaction_id: str) -> bool:
 _streaming_cards: dict[str, dict[str, Any]] = {}
 
 
-async def _send_thinking_card(chat_id: str, reply_to_msg_id: str | None = None) -> str | None:
+async def _send_thinking_card(chat_id: str, reply_to_msg_id: str | None = None, request_id: str | None = None) -> str | None:
     """Send a 'thinking' card and return the message_id for later updates.
 
     If reply_to_msg_id is provided, the card is sent as a reply (appears in
-    the same thread/topic). Otherwise it's sent as a new message.
+    the same thread/topic). If request_id is provided, a cancel button is added.
     """
     token = await get_access_token()
     base_url = DOMAIN_BASES.get(DOMAIN, DOMAIN_BASES["feishu"])
     client = _get_http_client()
+
+    elements: list[dict] = [
+        {"tag": "markdown", "content": "正在思考，请稍候..."},
+        {"tag": "hr"},
+    ]
+
+    # Add cancel button if request_id is available
+    if request_id:
+        elements.append(
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "❌ 取消"},
+                "type": "default",
+                "size": "small",
+                "behaviors": [{"type": "callback", "value": {"action": "cancel", "request_id": request_id}}],
+            }
+        )
+
     card = {
-        "config": {"wide_screen_mode": True},
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {"title": {"tag": "plain_text", "content": "🤔 思考中..."}, "template": "blue"},
-        "elements": [
-            {"tag": "markdown", "content": "正在思考，请稍候..."},
-            {"tag": "hr"},
-            {"tag": "note", "elements": [{"tag": "plain_text", "content": "kagent"}]},
-        ],
+        "body": {"elements": elements},
     }
 
     if reply_to_msg_id:
         # Reply to the original message (appears in the same thread)
+        content_json = json.dumps(card)
+        logger.debug("Sending card reply: msg_id=%s, content_len=%d", reply_to_msg_id, len(content_json))
         resp = await client.post(
             f"{base_url}/open-apis/im/v1/messages/{reply_to_msg_id}/reply",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"msg_type": "interactive", "content": json.dumps(card)},
+            json={"msg_type": "interactive", "content": content_json},
         )
-    else:
-        # Send as new message
-        resp = await client.post(
-            f"{base_url}/open-apis/im/v1/messages",
-            params={"receive_id_type": "chat_id"},
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"receive_id": chat_id, "msg_type": "interactive", "content": json.dumps(card)},
-        )
+        data = resp.json()
+        if data.get("code") == 0:
+            msg_id = data.get("data", {}).get("message_id")
+            if msg_id:
+                _streaming_cards[msg_id] = {"card_id": None, "content": ""}
+                return msg_id
+        logger.error("Reply failed: status=%s, code=%s, msg=%s — falling back to new message", resp.status_code, data.get("code"), data.get("msg"))
+
+    # Send as new message (either reply_to_msg_id was None or reply failed)
+    resp = await client.post(
+        f"{base_url}/open-apis/im/v1/messages",
+        params={"receive_id_type": "chat_id"},
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"receive_id": chat_id, "msg_type": "interactive", "content": json.dumps(card)},
+    )
 
     data = resp.json()
     if data.get("code") == 0:
@@ -206,11 +239,10 @@ async def _send_thinking_card(chat_id: str, reply_to_msg_id: str | None = None) 
     return None
 
 
-async def _update_streaming_card(message_id: str, new_content: str) -> None:
+async def _update_streaming_card(message_id: str, new_content: str, meta: dict[str, Any] | None = None) -> None:
     """Update the content of a streaming card.
 
-    Uses the Feishu message update API:
-    PATCH /open-apis/im/v1/messages/{message_id}
+    If meta is provided, token usage and agent info are shown in the footer.
     """
     tracked = _streaming_cards.get(message_id)
     if not tracked:
@@ -222,14 +254,41 @@ async def _update_streaming_card(message_id: str, new_content: str) -> None:
 
     markdown_text = _text_to_card_markdown(new_content)
     card = {
-        "config": {"wide_screen_mode": True},
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {"title": {"tag": "plain_text", "content": "💬 kagent 回复"}, "template": "blue"},
-        "elements": [
-            {"tag": "markdown", "content": markdown_text},
-            {"tag": "hr"},
-            {"tag": "note", "elements": [{"tag": "plain_text", "content": "kagent"}]},
-        ],
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": markdown_text},
+                {"tag": "hr"},
+            ],
+        },
     }
+
+    # Add metadata footer if available
+    if meta:
+        footer_parts = []
+        agent = meta.get("agent", "")
+        if agent:
+            footer_parts.append(f"🤖 {agent}")
+        elapsed = meta.get("elapsed", 0)
+        if elapsed:
+            footer_parts.append(f"⏱ {elapsed}s")
+        tokens = meta.get("tokens", {})
+        if tokens.get("total"):
+            prompt = tokens.get("prompt", 0)
+            response = tokens.get("response", 0)
+            total = tokens.get("total", 0)
+            footer_parts.append(f"📊 输入 {prompt:,} + 输出 {response:,} = {total:,}")
+
+        if footer_parts:
+            card["body"]["elements"].append(
+                {"tag": "markdown", "content": " | ".join(footer_parts), "text_size": "notation"}
+            )
+    else:
+        card["body"]["elements"].append(
+            {"tag": "markdown", "content": "_kagent_", "text_size": "notation"}
+        )
 
     resp = await client.patch(
         f"{base_url}/open-apis/im/v1/messages/{message_id}",
@@ -288,16 +347,15 @@ def decrypt_payload(encrypt_key: str, encrypted: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-async def invoke_a2a(input_text: str, context_id: str | None = None) -> tuple[str, str | None]:
-    """Call the kagent A2A endpoint (JSON-RPC) and return the response text.
+async def invoke_a2a(input_text: str, context_id: str | None = None) -> tuple[str, str | None, dict[str, Any] | None]:
+    """Call the kagent A2A endpoint (JSON-RPC) and return the response.
 
-    Returns (response_text, new_context_id).
-    If context_id is provided, the conversation continues from that context.
+    Returns (response_text, new_context_id, metadata).
+    metadata includes: token usage, agent name, response time, task_id, etc.
     """
     if not KAGENT_A2A_URL:
-        return "KAGENT_A2A_URL 未设置，请先配置环境变量。", None
+        return "KAGENT_A2A_URL 未设置，请先配置环境变量。", None, None
 
-    # A2A JSON-RPC request (see https://google.github.io/A2A/)
     params: dict[str, Any] = {
         "message": {
             "role": "user",
@@ -315,6 +373,7 @@ async def invoke_a2a(input_text: str, context_id: str | None = None) -> tuple[st
         "params": params,
     }
 
+    start_time = time.time()
     try:
         client = _get_http_client()
         response = await client.post(KAGENT_A2A_URL, json=request_body)
@@ -322,18 +381,19 @@ async def invoke_a2a(input_text: str, context_id: str | None = None) -> tuple[st
         result = response.json()
     except httpx.TimeoutException:
         logger.exception("A2A timeout")
-        return None, None  # signal: timeout
+        return None, None, None
     except httpx.HTTPStatusError as e:
         logger.exception("A2A HTTP error")
-        return None, None  # signal: error
+        return None, None, None
     except Exception as e:
         logger.exception("A2A call failed")
-        return None, None  # signal: error
+        return None, None, None
 
-    # Extract text from response
+    elapsed = time.time() - start_time
+
     if "error" in result:
         err = result["error"]
-        return f"kagent 返回错误: {err.get('message', err)}", None
+        return f"kagent 返回错误: {err.get('message', err)}", None, None
 
     task = result.get("result", {})
     parts: list[str] = []
@@ -342,11 +402,24 @@ async def invoke_a2a(input_text: str, context_id: str | None = None) -> tuple[st
             if part.get("kind") == "text" or "text" in part:
                 parts.append(part.get("text", ""))
 
-    # Extract the new context_id from the response
     new_context_id = task.get("contextId")
-
     reply = "".join(parts) if parts else "kagent 没有返回内容。"
-    return reply, new_context_id
+
+    task_id = task.get("id", "")
+    metadata = task.get("metadata", {})
+    usage = metadata.get("kagent_usage_metadata", {})
+    meta = {
+        "agent": metadata.get("kagent_author", ""),
+        "task_id": task_id,
+        "tokens": {
+            "prompt": usage.get("promptTokenCount", 0),
+            "response": usage.get("candidatesTokenCount", 0),
+            "total": usage.get("totalTokenCount", 0),
+        },
+        "elapsed": round(elapsed, 1),
+        "timestamp": task.get("status", {}).get("timestamp", ""),
+    }
+    return reply, new_context_id, meta
 
 
 # ---------------------------------------------------------------------------
@@ -470,65 +543,37 @@ async def reply_to_feishu_with_card(
 
 
 def _build_card(markdown_text: str, card_color: str, header_text: str) -> dict:
-    """Build a Feishu interactive card JSON object."""
+    """Build a Feishu interactive card JSON object (schema 2.0)."""
     return {
-        "config": {"wide_screen_mode": True},
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "title": {"tag": "plain_text", "content": header_text},
             "template": card_color,
         },
-        "elements": [
-            {"tag": "markdown", "content": markdown_text},
-            {"tag": "hr"},
-            {
-                "tag": "note",
-                "elements": [
-                    {"tag": "plain_text", "content": "Powered by kagent"}
-                ],
-            },
-        ],
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": markdown_text},
+                {"tag": "hr"},
+                {"tag": "markdown", "content": "_Powered by kagent_", "text_size": "notation"},
+            ],
+        },
     }
 
 
 def _text_to_card_markdown(text: str) -> str:
-    """Convert text to card-compatible content.
-
-    Feishu card markdown supports: **bold**, *italic*, ~~strikethrough~~,
-    `inline code`, ```code blocks```, [links](url), headers, lists.
-
-    Tables (| ... |) are NOT supported by the card markdown tag.
-    We convert them to plain text for readability.
+    """Return text as-is. Feishu card markdown tag supports:
+    - **bold**, *italic*, ~~strikethrough~~
+    - `code`, ```code blocks```
+    - [links](url)
+    - # 标题 (h1-h6)
+    - - 无序列表, 1. 有序列表
+    - | 表格 | 语法 |  ← 支持！
+    - > 引用, --- 分割线
+    - <font color='red'>彩色文本</font>
+    - 特殊字符需转义: < → &#60;, > → &#62;, & → &amp;
     """
-    lines = text.split("\n")
-    result = []
-    in_table = False
-
-    for line in lines:
-        stripped = line.strip()
-        # Skip separator rows like |---|---|
-        if re.match(r'^\|[\s\-:]+\|[\s\-:]+\|', stripped):
-            # Replace with a thin separator
-            result.append("")
-            continue
-        # Detect table rows: | col1 | col2 |
-        if stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 3:
-            cells = [c.strip() for c in stripped.split("|")[1:-1]]
-            if not in_table:
-                result.append("")
-                # Add header underline
-                header = " | ".join(cells)
-                result.append(f"**{header}**")
-                in_table = True
-            else:
-                result.append(" | ".join(cells))
-            continue
-        # End of table
-        if in_table:
-            result.append("")
-            in_table = False
-        result.append(line)
-
-    return "\n".join(result)
+    return text
 
 
 def _split_text_for_card(text: str, max_bytes: int = 80000) -> list[str]:
@@ -626,6 +671,65 @@ def _find_split_point(text: str, max_bytes: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Task tracking & cancel
+# ---------------------------------------------------------------------------
+
+_running_tasks: dict[str, dict[str, Any]] = {}
+
+
+async def _handle_card_action(event: dict[str, Any]) -> None:
+    """Handle card action trigger (button click)."""
+    ae = event.get("event", event)
+    action = ae.get("action", {})
+    value = action.get("value", {}) or {}
+    action_type = value.get("action", "")
+    context = ae.get("context", {})
+    chat_id = context.get("open_chat_id", "")
+    msg_id = context.get("open_message_id", "")
+
+    if action_type == "cancel":
+        request_id = value.get("request_id", "")
+        if request_id and request_id in _running_tasks:
+            task_info = _running_tasks[request_id]
+            # Cancel the background task — the CancelledError handler in
+            # _handle_message will update the card to "已取消"
+            task_info["task"].cancel()
+            logger.info("Cancelled A2A task %s (request %s)", task_info.get("task_id"), request_id)
+            # Also try A2A cancel if task_id is known
+            if task_info.get("task_id"):
+                try:
+                    base = KAGENT_A2A_URL.rstrip("/")
+                    body = {"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": "tasks/cancel", "params": {"id": task_info["task_id"]}}
+                    client = _get_http_client()
+                    await client.post(base, json=body, timeout=10)
+                except Exception:
+                    logger.exception("Error calling tasks/cancel")
+
+
+async def _cancel_task(task_id: str, chat_id: str, message_id: str) -> None:
+    """Cancel a running A2A task via tasks/cancel."""
+    base = KAGENT_A2A_URL.rstrip("/")
+    body = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "tasks/cancel",
+        "params": {"id": task_id},
+    }
+    try:
+        client = _get_http_client()
+        resp = await client.post(base, json=body, timeout=10)
+        if resp.status_code == 200:
+            logger.info("Task %s cancelled", task_id)
+            await reply_to_feishu_with_card(chat_id, "已取消 ✅", header_text="操作成功", card_color="grey")
+        else:
+            logger.error("Cancel %s failed: %s", task_id, resp.text)
+            await reply_to_feishu(chat_id, "取消失败，请重试")
+    except Exception as e:
+        logger.exception("Cancel task %s error", task_id)
+        await reply_to_feishu(chat_id, f"取消失败: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Event processing
 # ---------------------------------------------------------------------------
 
@@ -637,8 +741,36 @@ async def process_event(event: dict[str, Any]) -> None:
 
     if event_type == "im.message.receive_v1":
         await _handle_message(event.get("event", {}))
+    elif event_type == "card.action.trigger":
+        await _handle_card_action(event.get("event", {}))
     else:
         logger.debug("Ignoring event type: %s", event_type)
+
+
+async def _show_history(chat_id: str, text: str, thread_id: str | None, msg_id: str | None) -> None:
+    """Show recent conversation history from local memory."""
+    session = _sessions.get(chat_id)
+    if not session:
+        await reply_to_feishu(chat_id, "暂无对话历史")
+        return
+
+    history = session.get("history", [])
+    if not history:
+        await reply_to_feishu(chat_id, "暂无对话历史")
+        return
+
+    lines = ["📋 **最近对话历史**\n"]
+    for i, entry in enumerate(history[-10:], 1):
+        user_text = entry.get("user", "")[:80]
+        agent_text = entry.get("agent", "")[:100]
+        ts = entry.get("time", "")
+        lines.append(f"**#{i}** 🙋 {user_text}{'...' if len(user_text) >= 80 else ''}")
+        if agent_text:
+            lines.append(f"   🤖 {agent_text}{'...' if len(agent_text) >= 100 else ''}")
+        if ts:
+            lines.append(f"   🕐 {ts}")
+
+    await reply_to_feishu_with_card(chat_id, "\n".join(lines), header_text="📋 对话历史", card_color="blue")
 
 
 async def _handle_message(event: dict[str, Any]) -> None:
@@ -687,6 +819,11 @@ async def _handle_message(event: dict[str, Any]) -> None:
         if not text:
             return
 
+    # Check for commands
+    if text.lower() in ("/history", "/history ", "历史", "会话历史"):
+        await _show_history(chat_id, text, thread_id, msg_id)
+        return
+
     logger.info(
         "Received message: chat_id=%s thread_id=%s sender=%s text=%s",
         chat_id,
@@ -700,36 +837,69 @@ async def _handle_message(event: dict[str, Any]) -> None:
     if msg_id:
         thinking_reaction_id = await _add_reaction(msg_id, _FEISHU_REACTION_THINKING)
 
-    # 2. Send a "thinking" card immediately (reply to the original message for thread support)
-    card_msg_id = await _send_thinking_card(chat_id, reply_to_msg_id=msg_id)
+    # 2. Generate a unique request_id for tracking
+    request_id = str(uuid.uuid4())
 
-    # 3. Get session for context
+    # 3. Send a "thinking" card with cancel button (using request_id, task_id unknown yet)
+    card_msg_id = await _send_thinking_card(chat_id, reply_to_msg_id=msg_id, request_id=request_id)
+
+    # 4. Get session for context
     session = _get_session(chat_id)
     context_id = session.get("context_id")
 
-    # 4. Call A2A
-    reply, new_context_id = await invoke_a2a(text, context_id=context_id)
+    # 5. Start A2A call in background task
+    a2a_task = asyncio.create_task(invoke_a2a(text, context_id=context_id))
 
-    # 5. Update session with new context
-    if new_context_id:
-        _update_session(chat_id, new_context_id)
+    # Store task info for cancel
+    task_info = {
+        "task": a2a_task,
+        "task_id": None,
+        "card_msg_id": card_msg_id,
+        "chat_id": chat_id,
+        "request_id": request_id,
+        "thinking_reaction_id": thinking_reaction_id,
+        "msg_id": msg_id,
+    }
+    _running_tasks[request_id] = task_info
 
-    # 6. Handle errors
-    if reply is None:
+    try:
+        # 6. Wait for A2A to complete
+        reply, new_context_id, meta = await a2a_task
+
+        # Store task_id for cancel (if user clicks cancel after completion, it's a no-op)
+        if meta and meta.get("task_id"):
+            task_info["task_id"] = meta["task_id"]
+
+        # 7. Update session with new context and history
+        if new_context_id:
+            _update_session(chat_id, new_context_id, user_text=text, agent_text=reply or "")
+
+        # 8. Handle errors
+        if reply is None:
+            if card_msg_id:
+                await _update_streaming_card(card_msg_id, "⏰ kagent 响应超时，请稍后重试。", meta=meta)
+            if thinking_reaction_id and msg_id:
+                await _remove_reaction(msg_id, thinking_reaction_id)
+                await _add_reaction(msg_id, _FEISHU_REACTION_ERROR)
+            return
+
+        # 9. Update the streaming card with the final reply
         if card_msg_id:
-            await _update_streaming_card(card_msg_id, "⏰ kagent 响应超时，请稍后重试。")
+            await _update_streaming_card(card_msg_id, reply, meta=meta)
+
+        # 10. Remove thinking reaction on success
         if thinking_reaction_id and msg_id:
             await _remove_reaction(msg_id, thinking_reaction_id)
-            await _add_reaction(msg_id, _FEISHU_REACTION_ERROR)
-        return
 
-    # 7. Update the streaming card with the final reply
-    if card_msg_id:
-        await _update_streaming_card(card_msg_id, reply)
-
-    # 8. Remove thinking reaction on success
-    if thinking_reaction_id and msg_id:
-        await _remove_reaction(msg_id, thinking_reaction_id)
+    except asyncio.CancelledError:
+        # Task was cancelled by user
+        logger.info("A2A task %s was cancelled by user", request_id)
+        if card_msg_id:
+            await _update_streaming_card(card_msg_id, "已取消 ✅", meta={"agent": "", "elapsed": 0, "tokens": {}})
+        if thinking_reaction_id and msg_id:
+            await _remove_reaction(msg_id, thinking_reaction_id)
+    finally:
+        _running_tasks.pop(request_id, None)
 
 
 def _strip_mentions(text: str) -> str:
