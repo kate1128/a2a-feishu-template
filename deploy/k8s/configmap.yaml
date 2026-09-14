@@ -1,0 +1,15 @@
+# Non-secret configuration. Credentials go into the `feishu-bot-env` Secret
+# (see secret.example.yaml) — they are NOT stored here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feishu-bot-config
+  namespace: feishu-bot
+  labels:
+    app.kubernetes.io/name: a2a-feishu-bot
+data:
+  # feishu (CN, open.feishu.cn) or lark (global, open.larksuite.com)
+  FEISHU_DOMAIN: "feishu"
+  PORT: "9000"
+  # http://<kagent-controller-service-ip>:<port>/api/a2a/kagent/<your-agent-name>/
+  KAGENT_A2A_URL: "http://xxx.kagent.svc.cluster.local:8080/a2a/kagent/xxx"

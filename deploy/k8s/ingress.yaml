@@ -1,0 +1,29 @@
+# OPTIONAL — only needed for webhook-mode event delivery.
+# Requires an ingress controller (nginx, contour, HAProxy, ALB, ...).
+# Apply separately (not part of kustomization.yaml):
+#
+#   kubectl apply -f deploy/k8s/ingress.yaml
+#
+# Then point your Feishu app's "事件订阅" webhook URL at
+# https://feishu-bot.example.com/webhook/feishu
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: feishu-bot
+  namespace: feishu-bot
+  annotations:
+    # Adjust to your ingress controller
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: feishu-bot.example.com
+      http:
+        paths:
+          - path: /webhook/feishu
+            pathType: Prefix
+            backend:
+              service:
+                name: feishu-bot
+                port:
+                  name: http

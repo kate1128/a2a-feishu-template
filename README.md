@@ -41,7 +41,7 @@ uv run main.py
 |---|---|---|---|
 | `FEISHU_APP_ID` | ✅ | — | Feishu app ID (`cli_xxxx`) |
 | `FEISHU_APP_SECRET` | ✅ | — | Feishu app secret |
-| `KAGENT_A2A_URL` | ✅ | — | kagent A2A endpoint URL |
+| `KAGENT_A2A_URL` | ✅ | — | kagent A2A endpoint URL, format `http://<kagent-controller-service-ip>:<port>/api/a2a/kagent/<your-agent-name>/` |
 | `FEISHU_DOMAIN` | ❌ | `feishu` | `feishu` (China) or `lark` (international) |
 | `FEISHU_VERIFICATION_TOKEN` | ❌ | — | Webhook verification token |
 | `FEISHU_ENCRYPT_KEY` | ❌ | — | Event payload encryption key |
@@ -82,6 +82,50 @@ User: @bot hello
   → Card updated: reply with agent name, time, token usage
   → 👀 reaction removed
 ```
+
+## Deployment
+
+### Docker
+
+```bash
+docker build -t feishu-a2a-bot:latest .
+docker run --rm -d --name feishu-bot \
+  -p 9000:9000 \
+  --env-file .env \
+  feishu-a2a-bot:latest
+```
+
+The image runs as a non-root user on port 9000 and exposes a `/health` endpoint
+(used by the Docker `HEALTHCHECK` and the Kubernetes probes). `.env` is excluded
+from the build via [.dockerignore](.dockerignore) — credentials are injected at
+runtime, never baked into the image.
+
+### Kubernetes
+
+Manifests live in [deploy/k8s/](deploy/k8s/) (kustomize):
+
+```bash
+# 1. Build the image, push it to your registry, then update the `image:` field
+#    in deploy/k8s/deployment.yaml
+docker build -t <registry>/feishu-a2a-bot:latest .
+
+# 2. Create the credentials Secret (edit the manifest first)
+cp deploy/k8s/secret.example.yaml deploy/k8s/secret.yaml
+# fill in the real values, then:
+kubectl apply -f deploy/k8s/secret.yaml
+
+# 3. Deploy everything
+kubectl apply -k deploy/k8s/
+kubectl rollout status -n feishu-bot deploy/feishu-bot
+```
+
+Notes:
+
+- The Deployment intentionally runs **1 replica**: WebSocket mode keeps a single
+  long-lived Feishu connection and conversation sessions are in-memory. Scaling
+  out would open duplicate connections and duplicate/race events.
+- The bot dials Feishu **outbound**, so no Ingress is needed for WebSocket mode.
+  Webhook-mode fallback only: `kubectl apply -f deploy/k8s/ingress.yaml`.
 
 ## Prerequisites
 
